@@ -1,6 +1,6 @@
 interface:
   display_name: "ModelScope Studio Deploy"
-  short_description: "Deploy Gradio apps to ModelScope Studio safely"
-  default_prompt: "Use $modelscope-studio-deploy to deploy or update a Gradio app on ModelScope Studio with my `ms-...` access key and return the fresh tokenized share_url."
+  short_description: "Deploy ModelScope Studio apps with safe reuse and secrets"
+  default_prompt: "Use $modelscope-studio-deploy as a ModelScope Studio toolbox: check out an existing Studio if needed, deploy my own source tree, upload any required ModelScope secrets, and return the fresh tokenized share_url with my `ms-...` access key."
 policy:
   allow_implicit_invocation: false

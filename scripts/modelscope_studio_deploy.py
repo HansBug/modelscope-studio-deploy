@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -20,8 +21,10 @@ import requests
 DEFAULT_ENDPOINT = "https://www.modelscope.cn"
 DEFAULT_ACCESS_KEY_ENV = "MODELSCOPE_ACCESS_KEY"
 DEFAULT_SDK_TYPE = "gradio"
+SUPPORTED_SDK_TYPES = ("gradio", "streamlit", "static", "docker")
 DEFAULT_VERIFY_MODE = "config"
 DEFAULT_TIMEOUT = 30
+DEFAULT_REQUEST_RETRIES = 3
 STATUS_RUNNING = "Running"
 STATUS_CREATING = "Creating"
 NON_FATAL_RESET_MESSAGES = (
@@ -44,6 +47,13 @@ class DeploymentError(RuntimeError):
 class CommandResult:
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True)
+class SecretSpec:
+    name: str
+    value: str
+    source: str
 
 
 def _read_access_key(arg_value: str | None, env_name: str) -> str:
@@ -154,6 +164,61 @@ def _copy_source_tree(source_dir: Path, repo_dir: Path, *, sync_delete: bool) ->
     }
 
 
+def _parse_assignment(raw: str, *, option_name: str) -> tuple[str, str]:
+    name, separator, value = raw.partition("=")
+    if not separator:
+        raise DeploymentError(f"{option_name} expects NAME=VALUE format, got: {raw}")
+    name = name.strip()
+    if not name:
+        raise DeploymentError(f"{option_name} requires a non-empty name: {raw}")
+    return name, value
+
+
+def _normalize_secret_specs(secret_specs: Iterable[SecretSpec]) -> list[SecretSpec]:
+    deduped: dict[str, SecretSpec] = {}
+    for spec in secret_specs:
+        deduped[spec.name] = spec
+    return list(deduped.values())
+
+
+def _collect_secret_specs(args: argparse.Namespace) -> list[SecretSpec]:
+    secret_specs: list[SecretSpec] = []
+    for raw in args.secret or []:
+        name, value = _parse_assignment(raw, option_name="--secret")
+        secret_specs.append(SecretSpec(name=name, value=value, source="literal"))
+    for raw in args.secret_from_env or []:
+        name, env_name = _parse_assignment(raw, option_name="--secret-from-env")
+        if env_name not in os.environ:
+            raise DeploymentError(
+                f"Environment variable {env_name} is not set for --secret-from-env {name}={env_name}."
+            )
+        secret_specs.append(SecretSpec(name=name, value=os.environ[env_name], source=f"env:{env_name}"))
+    return _normalize_secret_specs(secret_specs)
+
+
+def _env_name(entry: dict[str, Any]) -> str:
+    return str(entry.get("VariableName") or entry.get("Name") or "").strip()
+
+
+def _env_id(entry: dict[str, Any]) -> int | None:
+    value = entry.get("VariableId")
+    if value is None:
+        value = entry.get("Id")
+    if value is None:
+        return None
+    return int(value)
+
+
+def _sanitize_env_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    safe_entry = {key: value for key, value in entry.items() if key != "Value"}
+    if "VariableName" not in safe_entry and entry.get("Name"):
+        safe_entry["VariableName"] = entry["Name"]
+    variable_id = _env_id(entry)
+    if variable_id is not None and "VariableId" not in safe_entry:
+        safe_entry["VariableId"] = variable_id
+    return safe_entry
+
+
 class ModelScopeStudioClient:
     def __init__(self, access_key: str, *, endpoint: str = DEFAULT_ENDPOINT) -> None:
         self.access_key = access_key
@@ -189,14 +254,29 @@ class ModelScopeStudioClient:
         timeout: int = DEFAULT_TIMEOUT,
     ) -> Any:
         url = path if path.startswith("http") else f"{self.api_base}{path}"
-        response = self.session.request(
-            method=method.upper(),
-            url=url,
-            json=json_body,
-            params=params,
-            headers=self._headers(method),
-            timeout=timeout,
-        )
+        response = None
+        for attempt in range(1, DEFAULT_REQUEST_RETRIES + 1):
+            try:
+                response = self.session.request(
+                    method=method.upper(),
+                    url=url,
+                    json=json_body,
+                    params=params,
+                    headers=self._headers(method),
+                    timeout=timeout,
+                )
+                break
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                if attempt >= DEFAULT_REQUEST_RETRIES:
+                    raise DeploymentError(
+                        f"Request to ModelScope failed after {attempt} attempts: {method.upper()} {url} ({exc})"
+                    ) from exc
+                time.sleep(attempt)
+            except requests.exceptions.RequestException as exc:
+                raise DeploymentError(f"Request to ModelScope failed: {method.upper()} {url} ({exc})") from exc
+
+        if response is None:
+            raise DeploymentError(f"Request to ModelScope did not return a response: {method.upper()} {url}")
         if raw_response:
             return response
 
@@ -253,6 +333,105 @@ class ModelScopeStudioClient:
                 return []
             raise
         return list(data.get("Logs") or [])
+
+    def list_envs(self, namespace: str, studio_name: str) -> list[dict[str, Any]]:
+        data = self._request("GET", f"/v1/studio/{namespace}/{studio_name}/envs")
+        envs = data.get("EnvironmentVariables") or []
+        return [dict(entry) for entry in envs]
+
+    def _put_env(self, namespace: str, studio_name: str, payload: dict[str, Any]) -> Any:
+        return self._request("PUT", f"/v1/studio/{namespace}/{studio_name}/envs", json_body=payload)
+
+    def apply_envs(
+        self,
+        namespace: str,
+        studio_name: str,
+        secret_specs: Iterable[SecretSpec],
+    ) -> list[dict[str, Any]]:
+        secret_specs = _normalize_secret_specs(secret_specs)
+        if not secret_specs:
+            return []
+
+        existing = {
+            _env_name(entry): entry
+            for entry in self.list_envs(namespace, studio_name)
+            if _env_name(entry)
+        }
+        results: list[dict[str, Any]] = []
+        for spec in secret_specs:
+            current = existing.get(spec.name)
+            if current is None:
+                payload = {
+                    "Operation": "add",
+                    "VariableName": spec.name,
+                    "VariableValue": spec.value,
+                }
+                action = "add"
+            else:
+                variable_id = _env_id(current)
+                if variable_id is None:
+                    raise DeploymentError(
+                        f"ModelScope env listing did not include VariableId for existing secret {spec.name}."
+                    )
+                payload = {
+                    "Operation": "modify",
+                    "VariableId": variable_id,
+                    "VariableName": spec.name,
+                    "VariableValue": spec.value,
+                }
+                action = "modify"
+
+            self._put_env(namespace, studio_name, payload)
+            refreshed = {
+                _env_name(entry): entry
+                for entry in self.list_envs(namespace, studio_name)
+                if _env_name(entry)
+            }
+            current = refreshed.get(spec.name)
+            if current is None:
+                raise DeploymentError(f"Secret {spec.name} was updated but could not be listed afterwards.")
+            existing = refreshed
+            results.append(
+                {
+                    "name": spec.name,
+                    "action": action,
+                    "source": spec.source,
+                    "variable_id": _env_id(current),
+                }
+            )
+        return results
+
+    def delete_env(self, namespace: str, studio_name: str, name: str) -> dict[str, Any]:
+        current = None
+        for entry in self.list_envs(namespace, studio_name):
+            if _env_name(entry) == name:
+                current = entry
+                break
+
+        if current is None:
+            return {
+                "name": name,
+                "deleted": False,
+                "reason": "not-found",
+            }
+
+        variable_id = _env_id(current)
+        if variable_id is None:
+            raise DeploymentError(f"ModelScope env listing did not include VariableId for secret {name}.")
+        self._put_env(
+            namespace,
+            studio_name,
+            {
+                "VariableId": variable_id,
+                "Operation": "delete",
+                "VariableName": name,
+            },
+        )
+        return {
+            "name": name,
+            "deleted": True,
+            "variable_id": variable_id,
+        }
 
     def get_default_sdk_version(self, sdk_type: str) -> str:
         data = self._request("GET", f"/v1/studios/sdk-version/{sdk_type}")
@@ -420,6 +599,40 @@ def _verify_config_url(config_url: str, timeout: int) -> dict[str, Any]:
     return payload
 
 
+def _verify_share_url(share_url: str, timeout: int) -> dict[str, Any]:
+    response = requests.get(share_url, timeout=timeout)
+    if response.status_code != 200:
+        raise DeploymentError(f"Share URL failed ({response.status_code}): {response.text[:500]}")
+    title_match = re.search(r"<title>(.*?)</title>", response.text, flags=re.IGNORECASE | re.DOTALL)
+    title = None
+    if title_match:
+        title = re.sub(r"\s+", " ", title_match.group(1)).strip()
+    return {
+        "status_code": response.status_code,
+        "content_type": response.headers.get("Content-Type"),
+        "title": title,
+        "body_preview": response.text[:500],
+    }
+
+
+def _run_fast_verification(*, sdk_type: str, urls: dict[str, str], timeout: int) -> dict[str, Any]:
+    if sdk_type == "static":
+        page_payload = _verify_share_url(urls["share_url"], timeout=timeout)
+        return {
+            "verification_target": "share_url",
+            "page_status_code": page_payload.get("status_code"),
+            "page_content_type": page_payload.get("content_type"),
+            "page_title": page_payload.get("title"),
+        }
+
+    config_payload = _verify_config_url(urls["config_url"], timeout=timeout)
+    return {
+        "verification_target": "config_url",
+        "config_title": config_payload.get("title"),
+        "config_version": config_payload.get("version"),
+    }
+
+
 def _browser_check(share_url: str, timeout_seconds: int) -> dict[str, Any]:
     try:
         from selenium import webdriver
@@ -444,7 +657,17 @@ def _browser_check(share_url: str, timeout_seconds: int) -> dict[str, Any]:
             title = driver.title
             if "Could not load this space." in body_text:
                 raise DeploymentError(f"Browser verification failed: {body_text}")
-            if title and title != "魔搭社区 - 创空间 - Gradio" and body_text.strip():
+            placeholder_titles = {
+                "魔搭社区 - 创空间 - Gradio",
+                "魔搭社区 - 创空间 - Streamlit",
+                "魔搭社区 - 创空间 - Static",
+                "魔搭社区 - 创空间 - Docker",
+            }
+            if body_text.strip() and (
+                title not in placeholder_titles
+                or len(body_text.strip().splitlines()) > 1
+                or len(body_text.strip()) > 80
+            ):
                 return {
                     "title": title,
                     "body_preview": body_text[:500],
@@ -470,9 +693,9 @@ def _build_share_urls(detail: dict[str, Any], studio_token: str) -> dict[str, st
     }
 
 
-def _resolve_sdk_version(client: ModelScopeStudioClient, requested: str) -> str:
+def _resolve_sdk_version(client: ModelScopeStudioClient, requested: str, sdk_type: str) -> str:
     if requested == "default":
-        return client.get_default_sdk_version(DEFAULT_SDK_TYPE)
+        return client.get_default_sdk_version(sdk_type)
     return requested
 
 
@@ -483,8 +706,9 @@ def _deploy(args: argparse.Namespace) -> dict[str, Any]:
     namespace = args.namespace or client.username
     if not namespace:
         raise DeploymentError("Namespace is required and could not be derived from the login response.")
+    secret_specs = _collect_secret_specs(args)
 
-    sdk_version = _resolve_sdk_version(client, args.sdk_version)
+    sdk_version = _resolve_sdk_version(client, args.sdk_version, args.sdk_type)
     instance_type_id = args.instance_type_id or client.get_default_instance_type_id()
 
     detail = client.get_studio(namespace, args.studio_name)
@@ -495,7 +719,7 @@ def _deploy(args: argparse.Namespace) -> dict[str, Any]:
         client.create_studio(
             namespace=namespace,
             studio_name=args.studio_name,
-            sdk_type=DEFAULT_SDK_TYPE,
+            sdk_type=args.sdk_type,
             sdk_version=sdk_version,
             instance_type_id=instance_type_id,
             instance_number=args.instance_number,
@@ -508,6 +732,7 @@ def _deploy(args: argparse.Namespace) -> dict[str, Any]:
 
     if detail is None:
         raise DeploymentError("Studio creation returned success but studio details were unavailable.")
+    status_before = client.get_status(namespace, args.studio_name)
 
     worktree = Path(args.worktree) if args.worktree else _default_worktree(namespace, args.studio_name)
     temp_worktree = False
@@ -536,11 +761,21 @@ def _deploy(args: argparse.Namespace) -> dict[str, Any]:
             access_key=access_key,
             commit_message=args.commit_message,
         )
+        secret_changes = client.apply_envs(namespace, args.studio_name, secret_specs)
     finally:
         if temp_worktree:
             shutil.rmtree(worktree, ignore_errors=True)
 
-    if args.start_mode != "skip":
+    should_restart = (
+        args.start_mode != "skip"
+        and (
+            created
+            or git_result.get("changed", False)
+            or bool(secret_changes)
+            or status_before.get("Status") != STATUS_RUNNING
+        )
+    )
+    if should_restart:
         client.reset_restart(namespace, args.studio_name)
         status_data = _wait_for_status(
             client,
@@ -556,12 +791,17 @@ def _deploy(args: argparse.Namespace) -> dict[str, Any]:
     detail = client.get_studio(namespace, args.studio_name) or detail
     studio_token = client.get_studio_token()
     urls = _build_share_urls(detail, studio_token)
+    sdk_type = detail.get("SdkType") or args.sdk_type
 
     verification: dict[str, Any] = {"mode": args.verify_mode}
     if args.verify_mode in {"config", "browser"}:
-        config_payload = _verify_config_url(urls["config_url"], timeout=args.request_timeout)
-        verification["config_title"] = config_payload.get("title")
-        verification["config_version"] = config_payload.get("version")
+        verification.update(
+            _run_fast_verification(
+                sdk_type=sdk_type,
+                urls=urls,
+                timeout=args.request_timeout,
+            )
+        )
     if args.verify_mode == "browser":
         verification["browser"] = _browser_check(urls["share_url"], timeout_seconds=args.browser_timeout)
 
@@ -570,11 +810,18 @@ def _deploy(args: argparse.Namespace) -> dict[str, Any]:
         "namespace": namespace,
         "studio_name": args.studio_name,
         "username": login_data.get("Username") or namespace,
+        "sdk_type": sdk_type,
         "sdk_version": detail.get("SdkVersion") or sdk_version,
         "status": status_data.get("Status"),
         "instance_type_id": detail.get("InstanceTypeId"),
         "source_changes": source_changes,
         "git": git_result,
+        "secrets": {
+            "applied": secret_changes,
+            "count": len(secret_changes),
+            "restart_required": bool(secret_changes),
+        },
+        "restart_triggered": should_restart,
         "urls": urls,
         "studio_token": studio_token,
         "verification": verification,
@@ -639,15 +886,21 @@ def _verify(args: argparse.Namespace) -> dict[str, Any]:
         raise DeploymentError(f"Studio does not exist: {namespace}/{args.studio_name}")
     token = client.get_studio_token()
     urls = _build_share_urls(detail, token)
-    config_payload = _verify_config_url(urls["config_url"], timeout=args.request_timeout)
+    sdk_type = detail.get("SdkType") or ""
     result: dict[str, Any] = {
         "namespace": namespace,
         "studio_name": args.studio_name,
+        "sdk_type": sdk_type,
         "urls": urls,
         "studio_token": token,
-        "config_title": config_payload.get("title"),
-        "config_version": config_payload.get("version"),
     }
+    result.update(
+        _run_fast_verification(
+            sdk_type=sdk_type,
+            urls=urls,
+            timeout=args.request_timeout,
+        )
+    )
     if args.verify_mode == "browser":
         result["browser"] = _browser_check(urls["share_url"], timeout_seconds=args.browser_timeout)
     return result
@@ -671,6 +924,95 @@ def _logs(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _checkout(args: argparse.Namespace) -> dict[str, Any]:
+    access_key = _read_access_key(args.access_key, args.access_key_env)
+    client = ModelScopeStudioClient(access_key, endpoint=args.endpoint)
+    client.login()
+    namespace = args.namespace or client.username
+    if not namespace:
+        raise DeploymentError("Namespace is required and could not be derived from the login response.")
+    detail = client.get_studio(namespace, args.studio_name)
+    if detail is None:
+        raise DeploymentError(f"Studio does not exist: {namespace}/{args.studio_name}")
+
+    worktree = Path(args.worktree) if args.worktree else _default_worktree(namespace, args.studio_name)
+    repo_dir = _ensure_repo(
+        endpoint=args.endpoint,
+        namespace=namespace,
+        studio_name=args.studio_name,
+        access_key=access_key,
+        worktree=worktree,
+    )
+    head = _run(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+    status = _run(["git", "status", "--porcelain"], cwd=repo_dir)
+    return {
+        "namespace": namespace,
+        "studio_name": args.studio_name,
+        "worktree": str(repo_dir),
+        "commit": head.stdout.strip(),
+        "dirty": bool(status.stdout.strip()),
+        "sdk_version": detail.get("SdkVersion"),
+    }
+
+
+def _secrets_list(args: argparse.Namespace) -> dict[str, Any]:
+    access_key = _read_access_key(args.access_key, args.access_key_env)
+    client = ModelScopeStudioClient(access_key, endpoint=args.endpoint)
+    client.login()
+    namespace = args.namespace or client.username
+    if not namespace:
+        raise DeploymentError("Namespace is required and could not be derived from the login response.")
+    envs = client.list_envs(namespace, args.studio_name)
+    return {
+        "namespace": namespace,
+        "studio_name": args.studio_name,
+        "environment_variables": [_sanitize_env_entry(entry) for entry in envs],
+        "total_count": len(envs),
+    }
+
+
+def _secrets_upsert(args: argparse.Namespace) -> dict[str, Any]:
+    access_key = _read_access_key(args.access_key, args.access_key_env)
+    client = ModelScopeStudioClient(access_key, endpoint=args.endpoint)
+    client.login()
+    namespace = args.namespace or client.username
+    if not namespace:
+        raise DeploymentError("Namespace is required and could not be derived from the login response.")
+
+    if args.value is not None:
+        secret_spec = SecretSpec(name=args.name, value=args.value, source="literal")
+    else:
+        if args.value_from_env not in os.environ:
+            raise DeploymentError(f"Environment variable {args.value_from_env} is not set.")
+        secret_spec = SecretSpec(
+            name=args.name,
+            value=os.environ[args.value_from_env],
+            source=f"env:{args.value_from_env}",
+        )
+
+    applied = client.apply_envs(namespace, args.studio_name, [secret_spec])
+    return {
+        "namespace": namespace,
+        "studio_name": args.studio_name,
+        "secret": applied[0],
+    }
+
+
+def _secrets_delete(args: argparse.Namespace) -> dict[str, Any]:
+    access_key = _read_access_key(args.access_key, args.access_key_env)
+    client = ModelScopeStudioClient(access_key, endpoint=args.endpoint)
+    client.login()
+    namespace = args.namespace or client.username
+    if not namespace:
+        raise DeploymentError("Namespace is required and could not be derived from the login response.")
+    result = client.delete_env(namespace, args.studio_name, args.name)
+    return {
+        "namespace": namespace,
+        "studio_name": args.studio_name,
+        "secret": result,
+    }
+
+
 def _add_common_auth_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--access-key", help="ModelScope access key. Defaults to MODELSCOPE_ACCESS_KEY.")
     parser.add_argument(
@@ -685,7 +1027,7 @@ def _add_common_auth_flags(parser: argparse.ArgumentParser) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Create, update, start, and verify a ModelScope Gradio studio.",
+        description="Create, update, start, and verify a ModelScope Studio app.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -702,6 +1044,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--sdk-version",
         default="default",
         help="SDK version to create with. Use 'default' to query the current platform default.",
+    )
+    deploy.add_argument(
+        "--sdk-type",
+        default=DEFAULT_SDK_TYPE,
+        choices=SUPPORTED_SDK_TYPES,
+        help=f"Studio SDK type used on creation. Default: {DEFAULT_SDK_TYPE}",
     )
     deploy.add_argument("--instance-type-id", type=int, help="Override the instance type id used during studio creation.")
     deploy.add_argument("--instance-number", type=int, default=1, help="Studio instance count used during studio creation.")
@@ -722,7 +1070,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     deploy.add_argument(
         "--commit-message",
-        default="Deploy Gradio app via Codex skill",
+        default="Deploy ModelScope Studio app via Codex skill",
         help="Git commit message used when repo contents changed.",
     )
     deploy.add_argument(
@@ -736,6 +1084,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_VERIFY_MODE,
         choices=["none", "config", "browser"],
         help="How to verify the final deployment.",
+    )
+    deploy.add_argument(
+        "--secret",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Add or update a Studio secret before restart. May be repeated.",
+    )
+    deploy.add_argument(
+        "--secret-from-env",
+        action="append",
+        default=[],
+        metavar="REMOTE_NAME=LOCAL_ENV",
+        help="Add or update a Studio secret from a local environment variable. May be repeated.",
     )
     deploy.add_argument("--wait-timeout", type=int, default=900, help="Seconds to wait for the studio to reach Running.")
     deploy.add_argument("--poll-interval", type=int, default=10, help="Polling interval in seconds while waiting.")
@@ -769,6 +1131,34 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_common_auth_flags(logs)
     logs.add_argument("--tail", type=int, default=200, help="Number of log lines to keep from the end.")
     logs.set_defaults(handler=_logs)
+
+    checkout = subparsers.add_parser("checkout", help="Clone or update the Studio git repo into a local worktree.")
+    _add_common_auth_flags(checkout)
+    checkout.add_argument(
+        "--worktree",
+        help="Local worktree path. Defaults to ~/.cache/codex-modelscope-studios/<namespace>-<studio>.",
+    )
+    checkout.set_defaults(handler=_checkout)
+
+    secrets = subparsers.add_parser("secrets", help="Manage Studio environment variables.")
+    secret_subparsers = secrets.add_subparsers(dest="secrets_command", required=True)
+
+    secrets_list = secret_subparsers.add_parser("list", help="List Studio environment variables without secret values.")
+    _add_common_auth_flags(secrets_list)
+    secrets_list.set_defaults(handler=_secrets_list)
+
+    secrets_upsert = secret_subparsers.add_parser("upsert", help="Add or update a Studio environment variable.")
+    _add_common_auth_flags(secrets_upsert)
+    secrets_upsert.add_argument("--name", required=True, help="Environment variable name.")
+    value_group = secrets_upsert.add_mutually_exclusive_group(required=True)
+    value_group.add_argument("--value", help="Literal environment variable value.")
+    value_group.add_argument("--value-from-env", help="Read the secret value from a local environment variable.")
+    secrets_upsert.set_defaults(handler=_secrets_upsert)
+
+    secrets_delete = secret_subparsers.add_parser("delete", help="Delete a Studio environment variable by name.")
+    _add_common_auth_flags(secrets_delete)
+    secrets_delete.add_argument("--name", required=True, help="Environment variable name.")
+    secrets_delete.set_defaults(handler=_secrets_delete)
 
     return parser
 
