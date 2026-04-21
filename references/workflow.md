@@ -12,7 +12,7 @@
 If the user did not explicitly provide a source directory, do not search broad parts of `/home`, cached worktrees, or unrelated repos trying to guess one.
 Use the current working tree, a user-provided path, or a repo obtained through `checkout`.
 Before changing `README.md`, `deployspec.entry_file`, or quick-create config files, read `references/modelscope_configs.md`.
-When invoking the deploy script from a shell assembled by Codex, prefer `MODELSCOPE_ACCESS_KEY=... python3 ...` over embedding a long `--access-key ms-...` literal into a heavily quoted command. Prefer `--secret-from-env` for sensitive values for the same reason.
+When invoking the deploy script from a shell assembled by an agent (Codex or Claude Code), prefer `MODELSCOPE_ACCESS_KEY=... python3 ...` over embedding a long `--access-key ms-...` literal into a heavily quoted command. Prefer `--secret-from-env` for sensitive values for the same reason.
 
 ## Fastest Safe Path
 
@@ -118,11 +118,20 @@ python3 scripts/modelscope_studio_deploy.py verify \
   --verify-mode browser
 ```
 
-## Codex Exec Example
+## Agent Exec Examples
+
+### Codex
 
 ```bash
 codex exec --skip-git-repo-check -C /home/hansbug \
   '$modelscope-studio-deploy 用我的本地源码目录部署到 HansBug/codex-skill-demo；如果创空间已存在，先 checkout 当前 repo；必要时上传 ModelScope secrets；然后返回 fresh tokenized share_url。key: ms-...'
+```
+
+### Claude Code
+
+```bash
+claude -p --permission-mode bypassPermissions \
+  '/modelscope-studio-deploy 用我的本地源码目录部署到 HansBug/codex-skill-demo；如果创空间已存在，先 checkout 当前 repo；必要时上传 ModelScope secrets；然后返回 fresh tokenized share_url。key: ms-...'
 ```
 
 ## Notes

@@ -1,6 +1,6 @@
 # modelscope-studio-deploy
 
-`modelscope-studio-deploy` is a Codex skill for deploying and updating ModelScope Studio apps with a full ModelScope access key such as `ms-...`.
+`modelscope-studio-deploy` is an agent skill for deploying and updating ModelScope Studio apps with a full ModelScope access key such as `ms-...`. It works with both OpenAI Codex CLI (`$modelscope-studio-deploy`) and Anthropic Claude Code (`/modelscope-studio-deploy`, or auto-triggered from the description).
 
 It is designed for two common cases:
 
@@ -28,7 +28,7 @@ The repository contains the skill prompt, helper references, and one execution-o
 ## Design Choices
 
 - `scripts/` only contains ModelScope interaction components
-- your app source should come from your own repo, working directory, or files Codex prepares outside these scripts
+- your app source should come from your own repo, working directory, or files the agent prepares outside these scripts
 - default lifecycle: `create-or-reuse`
 - default update mode: non-destructive overlay
 - destructive deletion requires explicit `--sync-delete`
@@ -40,9 +40,10 @@ The repository contains the skill prompt, helper references, and one execution-o
 .
 ├── SKILL.md
 ├── AGENTS.md
+├── CLAUDE.md -> AGENTS.md        # symlink, so both agents see the same project instruction
 ├── README.md
 ├── agents/
-│   └── openai.yaml
+│   └── openai.yaml               # Codex-only UI metadata; Claude Code ignores it
 ├── references/
 │   ├── modelscope_configs.md
 │   ├── troubleshooting.md
@@ -64,6 +65,8 @@ That reference consolidates the official documentation rules this skill relies o
 
 ## Installation
 
+### Codex CLI
+
 Install it into the Codex local skills directory:
 
 ```bash
@@ -72,7 +75,29 @@ git clone https://github.com/HansBug/modelscope-studio-deploy "${CODEX_HOME:-$HO
 
 Then invoke it explicitly as `$modelscope-studio-deploy`.
 
+### Claude Code
+
+Install it into the Claude local skills directory:
+
+```bash
+git clone https://github.com/HansBug/modelscope-studio-deploy "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/modelscope-studio-deploy"
+```
+
+Then invoke it explicitly as `/modelscope-studio-deploy`, or let Claude Code auto-trigger it from the `description` in `SKILL.md`.
+
+### Shared Clone (Both)
+
+If you want one working copy that serves both CLIs, clone the repo once and symlink it into each skills directory:
+
+```bash
+git clone https://github.com/HansBug/modelscope-studio-deploy ~/src/modelscope-studio-deploy
+ln -s ~/src/modelscope-studio-deploy "${CODEX_HOME:-$HOME/.codex}/skills/modelscope-studio-deploy"
+ln -s ~/src/modelscope-studio-deploy "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/modelscope-studio-deploy"
+```
+
 ## Copy-Paste Install Prompt
+
+### For Codex
 
 Paste this into Codex if you want it to install or update the skill and run a minimal smoke check:
 
@@ -83,6 +108,26 @@ Requirements:
 - install to "${CODEX_HOME:-$HOME/.codex}/skills/modelscope-studio-deploy"
 - if the repo already exists there, pull the latest main branch instead of recloning
 - use `SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/skills/modelscope-studio-deploy"` for validation commands
+- run:
+  1. python3 -m py_compile "$SKILL_DIR/scripts/modelscope_studio_deploy.py"
+  2. python3 "$SKILL_DIR/scripts/modelscope_studio_deploy.py" --help
+  3. python3 "$SKILL_DIR/scripts/modelscope_studio_deploy.py" deploy --help
+  4. python3 "$SKILL_DIR/scripts/modelscope_studio_deploy.py" checkout --help
+  5. python3 "$SKILL_DIR/scripts/modelscope_studio_deploy.py" secrets list --help
+- tell me the exact commands you ran and the result
+```
+
+### For Claude Code
+
+Paste this into Claude Code if you want it to install or update the skill and run a minimal smoke check:
+
+```text
+Install or update the GitHub repo https://github.com/HansBug/modelscope-studio-deploy into my Claude Code skills directory as modelscope-studio-deploy, then run a minimal validation.
+
+Requirements:
+- install to "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/modelscope-studio-deploy"
+- if the repo already exists there, pull the latest main branch instead of recloning
+- use `SKILL_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/modelscope-studio-deploy"` for validation commands
 - run:
   1. python3 -m py_compile "$SKILL_DIR/scripts/modelscope_studio_deploy.py"
   2. python3 "$SKILL_DIR/scripts/modelscope_studio_deploy.py" --help
@@ -145,11 +190,20 @@ python3 scripts/modelscope_studio_deploy.py logs \
 
 For `static` Studios, `verify --verify-mode config` automatically falls back to checking the tokenized `share_url` itself because `/config` is not consistently available there.
 
-## Codex Exec Example
+## Exec Examples
+
+### Codex
 
 ```bash
 codex exec --skip-git-repo-check -C /path/to/workdir \
   '$modelscope-studio-deploy 用我当前工作目录里的源码部署到 HansBug/my-demo；如果创空间已存在，先 checkout 当前 repo 供我对比或合并；必要时上传 ModelScope secrets；然后返回 fresh tokenized share_url。key: ms-...'
+```
+
+### Claude Code
+
+```bash
+claude -p --permission-mode bypassPermissions \
+  '/modelscope-studio-deploy 用我当前工作目录里的源码部署到 HansBug/my-demo；如果创空间已存在，先 checkout 当前 repo 供我对比或合并；必要时上传 ModelScope secrets；然后返回 fresh tokenized share_url。key: ms-...'
 ```
 
 ## Notes

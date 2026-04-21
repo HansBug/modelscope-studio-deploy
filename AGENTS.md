@@ -1,9 +1,9 @@
 # AGENTS.md
 
-This repository publishes a Codex skill.
+This repository publishes an agent skill that works with both OpenAI Codex and Anthropic Claude Code.
 Treat it as both:
 
-- the installable skill payload for Codex
+- the installable skill payload for Codex (`~/.codex/skills/modelscope-studio-deploy`) and Claude Code (`~/.claude/skills/modelscope-studio-deploy`)
 - the public GitHub source of truth for that payload
 
 ## Purpose
@@ -46,9 +46,11 @@ If you change one of these, update the docs and call it out in the commit.
 ## File Responsibilities
 
 - `SKILL.md`
-  Core invocation rules for Codex.
+  Core invocation rules that both Codex and Claude Code load as the skill body.
 - `agents/openai.yaml`
-  UI-facing skill metadata and default explicit invocation prompt.
+  Codex-specific UI metadata and default explicit invocation prompt. Claude Code ignores this file.
+- `CLAUDE.md`
+  Symlink to `AGENTS.md`; keeps Claude Code and Codex reading the same project instruction.
 - `references/workflow.md`
   Operational path for common deployment flows.
 - `references/modelscope_configs.md`
@@ -64,13 +66,13 @@ When runtime behavior changes, review all of these:
 
 - `SKILL.md`
 - `README.md`
-- `AGENTS.md`
+- `AGENTS.md` (`CLAUDE.md` is a symlink; editing `AGENTS.md` covers both)
 - `references/workflow.md`
 - `references/modelscope_configs.md`
 - `references/troubleshooting.md`
 - `agents/openai.yaml`
 
-If the change affects install or invocation, update the copy-paste prompt in `README.md`.
+If the change affects install or invocation, update the copy-paste prompt in `README.md` for both Codex and Claude Code paths.
 
 ## Validation Expectations
 
@@ -86,6 +88,7 @@ For behavior changes, also do real end-to-end checks:
 
 - one direct CLI deployment against ModelScope
 - one `codex exec` deployment using `$modelscope-studio-deploy`
+- one `claude -p` deployment using `/modelscope-studio-deploy` (or description-triggered)
 - one secret-backed deployment path
 - when reuse behavior changes, verify that remote-only files survive the default overlay path
 
